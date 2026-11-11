@@ -11,6 +11,7 @@ file (`logs/proxy.log`).
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import signal
@@ -130,21 +131,52 @@ def _subprocess_kwargs(*, pipe_output: bool = False) -> dict[str, Any]:
     return kwargs
 
 
-def _probe_our_health(port: int, timeout_s: float = 3.0) -> bool:
-    url = f"http://127.0.0.1:{port}/_health"
+def _is_loopback_host(host: str) -> bool:
+    cleaned = (host or "").strip()
+    if cleaned.startswith("[") and cleaned.endswith("]"):
+        cleaned = cleaned[1:-1]
+    if cleaned.lower() in ("", "localhost", "127.0.0.1", "::1"):
+        return True
+    try:
+        return ipaddress.ip_address(cleaned).is_loopback
+    except ValueError:
+        return False
+
+
+def _probe_connect_host(bind_host: str) -> str:
+    """Return a local connectable address for probing a bound listener."""
+    cleaned = (bind_host or "").strip()
+    if cleaned.startswith("[") and cleaned.endswith("]"):
+        cleaned = cleaned[1:-1]
+    if cleaned in ("", "0.0.0.0", "*"):
+        return "127.0.0.1"
+    if cleaned in ("::", "::0"):
+        return "::1"
+    return cleaned
+
+
+def _format_url_host(host: str) -> str:
+    return f"[{host}]" if ":" in host and not host.startswith("[") else host
+
+
+def _probe_our_health(port: int, host: str = "127.0.0.1", timeout_s: float = 3.0) -> bool:
+    connect_host = _probe_connect_host(host)
+    url = f"http://{_format_url_host(connect_host)}:{port}/_health"
     try:
         with urllib.request.urlopen(url, timeout=timeout_s) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
-            return data.get("status") == "ok" and data.get("listen") == f"127.0.0.1:{port}"
+            return data.get("status") == "ok" and data.get("listen") == f"{host}:{port}"
     except (urllib.error.URLError, OSError, ValueError):
         return False
 
 
-def _is_port_busy(port: int) -> bool:
+def _is_port_busy(port: int, host: str = "127.0.0.1") -> bool:
+    connect_host = _probe_connect_host(host)
+    family = socket.AF_INET6 if ":" in connect_host else socket.AF_INET
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        with socket.socket(family, socket.SOCK_STREAM) as s:
             s.settimeout(0.5)
-            return s.connect_ex(("127.0.0.1", port)) == 0
+            return s.connect_ex((connect_host, port)) == 0
     except OSError:
         return False
 
@@ -199,6 +231,8 @@ def _respawn_self(args: argparse.Namespace) -> None:
     cmd = [
         exe,
         str(ROOT / "service.py"),
+        "--host",
+        args.host,
         "--port",
         str(args.port),
         "--max-log-kb",
@@ -242,12 +276,21 @@ def _remove_pid_file(pid_path: Path) -> None:
 
 def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Headless background supervisor for AgentRouter Codex proxy.")
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bind address (default: 127.0.0.1 loopback only; pass 0.0.0.0 explicitly for Docker/LAN).",
+    )
     parser.add_argument("--port", type=int, default=int(os.environ.get("PROXY_PORT", "8788")))
     parser.add_argument("--max-log-kb", type=int, default=1024)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--no-auto-update", action="store_true")
     parser.add_argument("--skip-start-update", action="store_true", help=argparse.SUPPRESS)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    args.host = (args.host or "").strip() or "127.0.0.1"
+    if not (1 <= args.port <= 65535):
+        parser.error("--port must be between 1 and 65535")
+    return args
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -261,12 +304,22 @@ def main(argv: Optional[list[str]] = None) -> int:
     logger = RotatingFileLogger(ROOT / "logs" / "proxy.log", max_kb=args.max_log_kb)
     pid_path = ROOT / "logs" / "service.pid"
 
-    if _is_port_busy(args.port):
-        if _probe_our_health(args.port):
-            logger.write("ok   ", f"proxy already healthy on 127.0.0.1:{args.port} -- exiting cleanly")
+    if _is_port_busy(args.port, args.host):
+        if _probe_our_health(args.port, args.host):
+            logger.write("ok   ", f"proxy already healthy on {args.host}:{args.port} -- exiting cleanly")
             return 0
-        logger.write("fail ", f"port {args.port} is already occupied by another process -- leaving it untouched")
+        logger.write(
+            "fail ",
+            f"port {args.port} is already occupied (not matching {args.host}:{args.port}) -- leaving it untouched",
+        )
         return 2
+
+    if not _is_loopback_host(args.host):
+        logger.write(
+            "warn ",
+            f"non-loopback bind enabled ({args.host}:{args.port}) -- "
+            "restrict access with a firewall and avoid exposing a shared fallback API key",
+        )
 
     worker_python = _resolve_worker_python()
     if not _ensure_dependencies(worker_python, logger):
@@ -349,7 +402,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "uvicorn",
                 "proxy:app",
                 "--host",
-                "127.0.0.1",
+                args.host,
                 "--port",
                 str(args.port),
                 "--timeout-keep-alive",
@@ -358,7 +411,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "warning",
                 "--no-access-log",
             ]
-            logger.write("start", f"starting headless uvicorn on 127.0.0.1:{args.port}")
+            logger.write("start", f"starting headless uvicorn on {args.host}:{args.port}")
             proc = subprocess.Popen(cmd, **_subprocess_kwargs(pipe_output=True))
             with child_lock:
                 active_child["proc"] = proc
@@ -381,7 +434,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             ran_for = time.monotonic() - started_at
             logger.write("warn ", f"uvicorn exited with code {code} after {ran_for:.0f}s")
 
-            if _is_port_busy(args.port):
+            if _is_port_busy(args.port, args.host):
                 logger.write("fail ", f"port {args.port} occupied while restarting -- stopping")
                 return 2
 

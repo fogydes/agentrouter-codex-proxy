@@ -10,20 +10,22 @@
       2. Activates .venv if one is present, else falls back to system Python.
       3. Verifies fastapi / uvicorn / httpx are importable.
       4. Verifies a credential exists WITHOUT printing it.
-      5. Starts uvicorn bound to 127.0.0.1 (loopback only).
+      5. Starts uvicorn bound to $BindHost (default 127.0.0.1 loopback only).
 
     Usage:
-      .\start-proxy.ps1                  # interactive, Ctrl+C to stop
-      .\start-proxy.ps1 -Port 8788       # default or custom port
-      .\start-proxy.ps1 -Verbose_        # extra diagnostics
-      .\start-proxy.ps1 -Background      # launch headless background service
-      .\start-proxy.ps1 -Update          # check/apply fast-forward git updates before starting
-      .\start-proxy.ps1 -Service         # supervised, rotating log file
+      .\start-proxy.ps1                            # interactive, Ctrl+C to stop
+      .\start-proxy.ps1 -Port 8788                 # default or custom port
+      .\start-proxy.ps1 -BindHost 0.0.0.0          # bind non-loopback (Docker/LAN; restrict firewall!)
+      .\start-proxy.ps1 -Verbose_                  # extra diagnostics
+      .\start-proxy.ps1 -Background                # launch headless background service (no console window)
+      .\start-proxy.ps1 -Update                    # check/apply fast-forward git updates before starting
+      .\start-proxy.ps1 -Service                   # supervised, rotating log file
 #>
 
 [CmdletBinding()]
 param(
     [int]$Port = 8788,
+    [string]$BindHost = '127.0.0.1',
     [switch]$Verbose_,
     # Launch detached via pythonw.exe (no console window) and return immediately.
     [switch]$Background,
@@ -85,11 +87,32 @@ function Write-Err  { param([string]$m) Write-Line "[fail ] $m" 'Red' }
 # ---------------------------------------------------------------------------
 # 0. Fast single-instance guard.
 # ---------------------------------------------------------------------------
+if ([string]::IsNullOrWhiteSpace($BindHost)) { $BindHost = '127.0.0.1' } else { $BindHost = $BindHost.Trim() }
+
+function Get-ProbeHost {
+    param([string]$OnHost = '127.0.0.1')
+    switch ($OnHost) {
+        '0.0.0.0' { return '127.0.0.1' }
+        '*'       { return '127.0.0.1' }
+        '::'      { return '::1' }
+        '[::]'    { return '::1' }
+        default   { return $OnHost }
+    }
+}
+
+function Test-IsLoopbackHost {
+    param([string]$OnHost = '127.0.0.1')
+    $clean = $OnHost.Trim().Trim('[', ']').ToLowerInvariant()
+    return ($clean -eq '127.0.0.1' -or $clean -eq 'localhost' -or $clean -eq '::1')
+}
+
 function Test-OurProxy {
-    param([int]$OnPort)
+    param([int]$OnPort, [string]$OnHost = '127.0.0.1')
+    $probeHost = Get-ProbeHost -OnHost $OnHost
+    $urlHost = if ($probeHost -match ':' -and -not $probeHost.StartsWith('[')) { "[$probeHost]" } else { $probeHost }
     try {
-        $probe = Invoke-RestMethod "http://127.0.0.1:$OnPort/_health" -TimeoutSec 5 -ErrorAction Stop
-        return ($probe.status -eq 'ok' -and $probe.listen -eq "127.0.0.1:$OnPort")
+        $probe = Invoke-RestMethod "http://${urlHost}:${OnPort}/_health" -TimeoutSec 5 -ErrorAction Stop
+        return ($probe.status -eq 'ok' -and $probe.listen -eq "${OnHost}:${OnPort}")
     } catch { return $false }
 }
 
@@ -115,8 +138,8 @@ function Show-PortConflict {
 
 $owners = Get-PortOwners -OnPort $Port
 if ($owners.Count -gt 0) {
-    if (Test-OurProxy -OnPort $Port) {
-        Write-Ok "proxy already healthy on 127.0.0.1:$Port (PID $($owners -join ', ')) -- nothing to do"
+    if (Test-OurProxy -OnPort $Port -OnHost $BindHost) {
+        Write-Ok "proxy already healthy on ${BindHost}:${Port} (PID $($owners -join ', ')) -- nothing to do"
         exit 0
     }
     Show-PortConflict -OnPort $Port -OwnerPids $owners
@@ -255,12 +278,20 @@ $env:PROXY_PORT = "$Port"
 $upstream = $env:AGENTROUTER_UPSTREAM
 if ([string]::IsNullOrWhiteSpace($upstream)) { $upstream = 'https://agentrouter.org' }
 
+$isLoopback = Test-IsLoopbackHost -OnHost $BindHost
+$bindNote = if ($isLoopback) { '(loopback only)' } else { '(non-loopback -- firewall required!)' }
+$displayProbeHost = Get-ProbeHost -OnHost $BindHost
+$displayProbeUrl = if ($displayProbeHost -match ':' -and -not $displayProbeHost.StartsWith('[')) { "[$displayProbeHost]" } else { $displayProbeHost }
+if (-not $isLoopback) {
+    Write-Warn "Non-loopback bind enabled (${BindHost}:${Port}) -- restrict access with a firewall and avoid exposing a shared fallback API key."
+}
+
 Write-Line ''
 Write-Line '  AgentRouter Codex Responses Compatibility Proxy' 'White'
 Write-Line "  upstream : $upstream"  'DarkGray'
-Write-Line "  listen   : http://127.0.0.1:$Port (loopback only)" 'DarkGray'
-Write-Line "  stats    : http://127.0.0.1:$Port/_stats" 'DarkGray'
-Write-Line "  health   : http://127.0.0.1:$Port/_health" 'DarkGray'
+Write-Line "  listen   : http://${BindHost}:${Port} $bindNote" 'DarkGray'
+Write-Line "  stats    : http://${displayProbeUrl}:${Port}/_stats" 'DarkGray'
+Write-Line "  health   : http://${displayProbeUrl}:${Port}/_health" 'DarkGray'
 if ($Service) { Write-Line "  log      : $($script:LogPath) (rotates at $MaxLogKB KB)" 'DarkGray' }
 else          { Write-Line '  stop     : Ctrl+C' 'DarkGray' }
 Write-Line ''
@@ -279,12 +310,12 @@ function Stop-OwnUvicorn {
 }
 
 function Invoke-Uvicorn {
-    param([int]$OnPort)
+    param([int]$OnPort, [string]$OnHost = '127.0.0.1')
     $savedPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     $script:LastUvicornExit = $null
     try {
-        & $python -m uvicorn proxy:app --host 127.0.0.1 --port $OnPort --timeout-keep-alive 600 --log-level warning --no-access-log 2>&1 |
+        & $python -m uvicorn proxy:app --host $OnHost --port $OnPort --timeout-keep-alive 600 --log-level warning --no-access-log 2>&1 |
             ForEach-Object { Write-Line ([string]$_) }
         $script:LastUvicornExit = $LASTEXITCODE
     } finally {
@@ -303,16 +334,16 @@ if ($Background) {
         Write-Err 'pythonw.exe or service.py not found for -Background mode.'
         exit 1
     }
-    $svcArgs = "`"$serviceScript`" --port $Port --max-log-kb $MaxLogKB"
+    $svcArgs = "`"$serviceScript`" --host `"$BindHost`" --port $Port --max-log-kb $MaxLogKB"
     if ($Verbose_) { $svcArgs += ' --verbose' }
     Start-Process -FilePath $pythonw -ArgumentList $svcArgs -WorkingDirectory $root -WindowStyle Hidden
     $ready = $false
     for ($i = 0; $i -lt 30; $i++) {
         Start-Sleep -Milliseconds 300
-        if (Test-OurProxy -OnPort $Port) { $ready = $true; break }
+        if (Test-OurProxy -OnPort $Port -OnHost $BindHost) { $ready = $true; break }
     }
     if ($ready) {
-        Write-Ok "proxy running cleanly in headless background mode on http://127.0.0.1:$Port"
+        Write-Ok "proxy running cleanly in headless background mode on http://${BindHost}:${Port}"
     } else {
         Write-Warn "background service started; check logs\proxy.log if /_health is not up yet."
     }
@@ -324,7 +355,7 @@ if ($Service) {
     while ($true) {
         $runStart = [System.Diagnostics.Stopwatch]::StartNew()
         Write-Step 'Supervisor: starting proxy under supervision...'
-        Invoke-Uvicorn -OnPort $Port
+        Invoke-Uvicorn -OnPort $Port -OnHost $BindHost
         $runStart.Stop()
         $ranForSec = $runStart.Elapsed.TotalSeconds
 
@@ -336,7 +367,7 @@ if ($Service) {
     }
 } else {
     try {
-        Invoke-Uvicorn -OnPort $Port
+        Invoke-Uvicorn -OnPort $Port -OnHost $BindHost
     } finally {
         Write-Ok 'Proxy stopped.'
     }

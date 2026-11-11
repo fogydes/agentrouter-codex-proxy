@@ -23,14 +23,18 @@ This proxy eliminates this issue by:
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+from contextlib import asynccontextmanager
 import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+import ipaddress
 import json
 import logging
 import os
+from pathlib import Path
 import random
 import re
 import socket
@@ -199,8 +203,77 @@ def _load_env():
 _load_env()
 
 UPSTREAM = os.environ.get("AGENTROUTER_UPSTREAM", "https://agentrouter.org").rstrip("/")
-LISTEN_HOST = "127.0.0.1"
+DEFAULT_LISTEN_HOST = "127.0.0.1"
+
+
+def is_loopback_host(host: str) -> bool:
+    """Return True when *host* resolves to a loopback interface."""
+    cleaned = (host or "").strip()
+    if cleaned.startswith("[") and cleaned.endswith("]"):
+        cleaned = cleaned[1:-1]
+    if cleaned.lower() in ("", "localhost", "127.0.0.1", "::1"):
+        return True
+    try:
+        return ipaddress.ip_address(cleaned).is_loopback
+    except ValueError:
+        return False
+
+
+def _extract_uvicorn_bind_overrides(
+    argv: list[str], default_host: str, default_port: int
+) -> tuple[str, int]:
+    """Sync LISTEN_HOST/PORT with uvicorn CLI flags so /_health stays accurate."""
+    if not argv:
+        return default_host, default_port
+    exe_name = Path(argv[0]).name.lower()
+    if "uvicorn" not in exe_name and "proxy:app" not in argv[1:]:
+        return default_host, default_port
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--host", default=default_host)
+    parser.add_argument("--port", type=int, default=default_port)
+    try:
+        known, _ = parser.parse_known_args(argv[1:])
+    except SystemExit:
+        return default_host, default_port
+    host = (known.host or "").strip() or default_host
+    port = known.port if 1 <= known.port <= 65535 else default_port
+    return host, port
+
+
+def _parse_proxy_cli_args(
+    argv: Optional[list[str]] = None,
+    default_host: str = DEFAULT_LISTEN_HOST,
+    default_port: Optional[int] = None,
+) -> argparse.Namespace:
+    """Parse standalone CLI arguments for running `python proxy.py`."""
+    resolved_default_port = default_port if default_port is not None else PORT
+    parser = argparse.ArgumentParser(
+        description="Local OpenAI Responses API compatibility proxy for Codex & AgentRouter."
+    )
+    parser.add_argument(
+        "--host",
+        default=default_host,
+        help=(
+            f"Bind address (default: {default_host} loopback only; pass 0.0.0.0 "
+            "explicitly when running inside Docker/Proxmox behind a firewall)."
+        ),
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=resolved_default_port,
+        help=f"Listen port (default: {resolved_default_port}).",
+    )
+    args = parser.parse_args(argv)
+    args.host = (args.host or "").strip() or default_host
+    if not (1 <= args.port <= 65535):
+        parser.error("--port must be between 1 and 65535")
+    return args
+
+
+LISTEN_HOST = DEFAULT_LISTEN_HOST
 PORT = int(os.environ.get("PROXY_PORT", "8788"))
+LISTEN_HOST, PORT = _extract_uvicorn_bind_overrides(sys.argv, LISTEN_HOST, PORT)
 RETRY_DELAY_MS = int(os.environ.get("PROXY_RETRY_DELAY_MS", "300"))
 VERBOSE = os.environ.get("PROXY_VERBOSE", "1") not in ("0", "", "false", "False")
 
@@ -694,17 +767,29 @@ async def _send_with_transport_retry(
 # ----------------------------------------------------------------------------
 # FastAPI Application
 # ----------------------------------------------------------------------------
+@asynccontextmanager
+async def _app_lifespan(_: FastAPI):
+    if not is_loopback_host(LISTEN_HOST):
+        logger.warning(
+            "Non-loopback bind enabled (%s:%s) -- restrict access with a firewall "
+            "and avoid exposing a shared fallback API key",
+            LISTEN_HOST,
+            PORT,
+        )
+    try:
+        yield
+    finally:
+        global _SHARED_CLIENT
+        if _SHARED_CLIENT and not _SHARED_CLIENT.is_closed:
+            await _SHARED_CLIENT.aclose()
+
+
 app = FastAPI(
     title="agentrouter-codex-proxy",
     description="Local compatibility proxy fixing OpenAI Responses cross-resource errors for Codex",
     version="1.5.0",
+    lifespan=_app_lifespan,
 )
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    global _SHARED_CLIENT
-    if _SHARED_CLIENT and not _SHARED_CLIENT.is_closed:
-        await _SHARED_CLIENT.aclose()
 
 def _filter_headers(headers: Dict[str, str]) -> Dict[str, str]:
     """Filters client headers for proxy forwarding and injects fallback auth if needed."""
@@ -1350,6 +1435,14 @@ async def passthrough_handler(request: Request, path: str):
 # ----------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    print(f"[*] Starting agentrouter-codex-proxy on http://{LISTEN_HOST}:{PORT}")
+
+    cli_args = _parse_proxy_cli_args(default_host=LISTEN_HOST, default_port=PORT)
+    LISTEN_HOST = cli_args.host
+    PORT = cli_args.port
+    os.environ["PROXY_PORT"] = str(PORT)
+
+    bind_scope = "loopback only" if is_loopback_host(LISTEN_HOST) else "non-loopback -- firewall required"
+    url_host = f"[{LISTEN_HOST}]" if ":" in LISTEN_HOST and not LISTEN_HOST.startswith("[") else LISTEN_HOST
+    print(f"[*] Starting agentrouter-codex-proxy on http://{url_host}:{PORT} ({bind_scope})")
     print(f"[*] Forwarding to upstream: {UPSTREAM}")
     uvicorn.run(app, host=LISTEN_HOST, port=PORT, timeout_keep_alive=600, log_level="info")

@@ -473,10 +473,14 @@ class TestUpdaterAndHeadlessService(unittest.TestCase):
 
         if sys.platform == "win32":
             self.assertEqual(service._CREATE_NO_WINDOW, 0x08000000)
-        parsed = service._parse_args(["--port", "8799", "--max-log-kb", "128", "--no-auto-update"])
+        parsed = service._parse_args(["--host", "0.0.0.0", "--port", "8799", "--max-log-kb", "128", "--no-auto-update"])
+        self.assertEqual(parsed.host, "0.0.0.0")
         self.assertEqual(parsed.port, 8799)
         self.assertEqual(parsed.max_log_kb, 128)
         self.assertTrue(parsed.no_auto_update)
+        self.assertEqual(service._probe_connect_host("0.0.0.0"), "127.0.0.1")
+        self.assertEqual(service._probe_connect_host("::"), "::1")
+        self.assertEqual(service._probe_connect_host("192.168.1.25"), "192.168.1.25")
 
         with tempfile.TemporaryDirectory() as tmp:
             log_file = Path(tmp) / "logs" / "proxy.log"
@@ -487,6 +491,81 @@ class TestUpdaterAndHeadlessService(unittest.TestCase):
                 logger._line_count = 0
             self.assertTrue(log_file.is_file())
             self.assertTrue(Path(f"{log_file}.1").is_file())
+
+    def test_cli_host_and_port_flags_and_live_bind(self):
+        import json
+        import socket
+        import subprocess
+        import time
+        import urllib.request
+        from pathlib import Path
+        import service
+
+        self.assertTrue(proxy.is_loopback_host("127.0.0.1"))
+        self.assertTrue(proxy.is_loopback_host("localhost"))
+        self.assertTrue(proxy.is_loopback_host("::1"))
+        self.assertFalse(proxy.is_loopback_host("0.0.0.0"))
+        self.assertFalse(proxy.is_loopback_host("192.168.10.20"))
+
+        default_args = proxy._parse_proxy_cli_args([])
+        self.assertEqual(default_args.host, "127.0.0.1")
+
+        custom_args = proxy._parse_proxy_cli_args(["--host", "0.0.0.0", "--port", "9878"])
+        self.assertEqual(custom_args.host, "0.0.0.0")
+        self.assertEqual(custom_args.port, 9878)
+
+        uv_host, uv_port = proxy._extract_uvicorn_bind_overrides(
+            ["uvicorn", "proxy:app", "--host", "0.0.0.0", "--port", "9012"],
+            "127.0.0.1",
+            8788,
+        )
+        self.assertEqual((uv_host, uv_port), ("0.0.0.0", 9012))
+        self.assertEqual(
+            proxy._extract_uvicorn_bind_overrides(["unittest", "--port", "1234"], "127.0.0.1", 8788),
+            ("127.0.0.1", 8788),
+        )
+
+        root = Path(proxy.__file__).resolve().parent
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+
+        proc = subprocess.Popen(
+            [sys.executable, str(root / "proxy.py"), "--host", "0.0.0.0", "--port", str(port)],
+            cwd=str(root),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            health = None
+            deadline = time.monotonic() + 12.0
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    out = proc.stdout.read() if proc.stdout else ""
+                    self.fail(f"proxy.py exited early ({proc.returncode}): {out}")
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/_health", timeout=1.0) as resp:
+                        health = json.loads(resp.read().decode("utf-8"))
+                        break
+                except Exception:
+                    time.sleep(0.2)
+
+            self.assertIsNotNone(health, "proxy.py --host 0.0.0.0 did not answer /_health in time")
+            self.assertEqual(health["status"], "ok")
+            self.assertEqual(health["listen"], f"0.0.0.0:{port}")
+            self.assertTrue(service._probe_our_health(port, "0.0.0.0"))
+            self.assertFalse(service._probe_our_health(port, "127.0.0.1"))
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=3.0)
+            if proc.stdout:
+                proc.stdout.close()
 
 
 if __name__ == "__main__":

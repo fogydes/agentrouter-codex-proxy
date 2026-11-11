@@ -65,10 +65,21 @@ Use the same resource that created the item to access it. [trace_id=...]
 ### 2. Quick Start (Interactive or Headless Background)
 ```powershell
 cd D:\Projects\agentrouter-codex-proxy
-.\start-proxy.ps1              # interactive foreground
-.\start-proxy.ps1 -Background  # headless background service (no console window)
-.\start-proxy.ps1 -Update      # check/apply fast-forward git updates before starting
+.\start-proxy.ps1                    # interactive foreground
+.\start-proxy.ps1 -Background        # headless background service (no console window)
+.\start-proxy.ps1 -Update            # check/apply fast-forward git updates before starting
+.\start-proxy.ps1 -BindHost 0.0.0.0  # bind non-loopback (Docker/LAN; restrict with firewall!)
 ```
+
+Direct Python / Linux / Docker usage with optional `--host` and `--port`:
+```bash
+python proxy.py --host 0.0.0.0 --port 8788
+# or via headless supervisor / uvicorn:
+python service.py --host 0.0.0.0 --port 8788
+uvicorn proxy:app --host 0.0.0.0 --port 8788
+```
+> [!IMPORTANT]
+> By default the listener binds `127.0.0.1` (loopback only) and cannot be changed via `.env`. Only pass `--host 0.0.0.0` (or `-BindHost 0.0.0.0`) inside isolated Docker/Proxmox or firewalled LAN setups, and avoid setting a shared fallback API key if other machines can reach the port.
 
 ### 3. Autostart as a Headless Background Task (Recommended)
 Registers a Windows Task Scheduler logon task running `service.py` via GUI-subsystem `pythonw.exe` (no console or Windows Terminal window opens) with automatic rotating logs (`logs/proxy.log`) and a safe fast-forward auto-updater (`updater.py`):
