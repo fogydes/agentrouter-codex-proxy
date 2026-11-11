@@ -121,6 +121,13 @@ def resilient_socket_init(self, *args, **kwargs):
             if hasattr(socket, "SIO_KEEPALIVE_VALS"):
                 # Windows: probe after 15s idle, then every 2s
                 self.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 15000, 2000))
+            else:
+                if hasattr(socket, "TCP_KEEPIDLE"):
+                    self.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 15)
+                if hasattr(socket, "TCP_KEEPINTVL"):
+                    self.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 2)
+                if hasattr(socket, "TCP_KEEPCNT"):
+                    self.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5)
     except Exception:
         pass
 

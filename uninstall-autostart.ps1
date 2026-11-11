@@ -56,6 +56,16 @@ if (-not $isOurs) {
 
 foreach ($procId in $ownerPids) {
     try {
+        $procInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $procId" -ErrorAction SilentlyContinue
+        if ($procInfo -and $procInfo.ParentProcessId) {
+            $parentInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $($procInfo.ParentProcessId)" -ErrorAction SilentlyContinue
+            if ($parentInfo -and "$($parentInfo.CommandLine)" -match 'service\.py|start-proxy\.ps1') {
+                Stop-Process -Id $parentInfo.ProcessId -Force -ErrorAction SilentlyContinue
+                Write-Host "[ ok  ] stopped supervisor PID $($parentInfo.ProcessId)" -ForegroundColor Green
+            }
+        }
+    } catch { }
+    try {
         Stop-Process -Id $procId -Force -ErrorAction Stop
         Write-Host "[ ok  ] stopped proxy process PID $procId" -ForegroundColor Green
     } catch {

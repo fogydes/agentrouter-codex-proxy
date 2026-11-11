@@ -392,5 +392,102 @@ class ProxyRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(mock.calls), 3)
 
 
+class TestUpdaterAndHeadlessService(unittest.TestCase):
+    def _run_git(self, cwd, *args):
+        import subprocess
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+        return proc.stdout.strip()
+
+    def test_updater_check_apply_dirty_and_rollback(self):
+        import tempfile
+        from pathlib import Path
+        import updater
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            remote = base / "remote.git"
+            pusher = base / "pusher"
+            work = base / "work"
+
+            self._run_git(base, "init", "--bare", str(remote))
+            self._run_git(base, "clone", str(remote), str(pusher))
+            self._run_git(pusher, "config", "user.email", "test@example.com")
+            self._run_git(pusher, "config", "user.name", "Test")
+            (pusher / "proxy.py").write_text("V = 1\n", encoding="utf-8")
+            (pusher / "requirements.txt").write_text("", encoding="utf-8")
+            self._run_git(pusher, "add", "proxy.py", "requirements.txt")
+            self._run_git(pusher, "commit", "-m", "init")
+            branch = self._run_git(pusher, "symbolic-ref", "--short", "HEAD")
+            self._run_git(pusher, "push", "-u", "origin", branch)
+
+            self._run_git(base, "clone", str(remote), str(work))
+
+            # Clean fast-forward pull
+            (pusher / "proxy.py").write_text("V = 2\n", encoding="utf-8")
+            self._run_git(pusher, "add", "proxy.py")
+            self._run_git(pusher, "commit", "-m", "v2")
+            self._run_git(pusher, "push", "origin", branch)
+
+            chk = updater.check_for_update(work)
+            self.assertEqual(chk["status"], "update_available")
+            applied = updater.apply_update(work, python_exe=sys.executable)
+            self.assertTrue(applied["applied"])
+            self.assertEqual(applied["status"], "updated")
+
+            # Dirty tracked edits block overwrite
+            (pusher / "proxy.py").write_text("V = 3\n", encoding="utf-8")
+            self._run_git(pusher, "add", "proxy.py")
+            self._run_git(pusher, "commit", "-m", "v3")
+            self._run_git(pusher, "push", "origin", branch)
+            (work / "proxy.py").write_text("V = 99\n", encoding="utf-8")
+            dirty = updater.apply_update(work, python_exe=sys.executable)
+            self.assertFalse(dirty["applied"])
+            self.assertEqual(dirty["status"], "dirty_worktree")
+            self._run_git(work, "checkout", "--", "proxy.py")
+            good = updater.apply_update(work, python_exe=sys.executable)
+            self.assertTrue(good["applied"])
+            good_sha = good["local_commit"]
+
+            # Broken syntax rolls back cleanly
+            (pusher / "proxy.py").write_text("def bad(:\n", encoding="utf-8")
+            self._run_git(pusher, "add", "proxy.py")
+            self._run_git(pusher, "commit", "-m", "bad")
+            self._run_git(pusher, "push", "origin", branch)
+            rolled = updater.apply_update(work, python_exe=sys.executable)
+            self.assertFalse(rolled["applied"])
+            self.assertEqual(rolled["status"], "rolled_back")
+            self.assertEqual(self._run_git(work, "rev-parse", "HEAD"), good_sha)
+
+    def test_service_rotating_logger_and_headless_flags(self):
+        import tempfile
+        from pathlib import Path
+        import service
+
+        if sys.platform == "win32":
+            self.assertEqual(service._CREATE_NO_WINDOW, 0x08000000)
+        parsed = service._parse_args(["--port", "8799", "--max-log-kb", "128", "--no-auto-update"])
+        self.assertEqual(parsed.port, 8799)
+        self.assertEqual(parsed.max_log_kb, 128)
+        self.assertTrue(parsed.no_auto_update)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log_file = Path(tmp) / "logs" / "proxy.log"
+            logger = service.RotatingFileLogger(log_file, max_kb=64)
+            logger.max_bytes = 200
+            for i in range(20):
+                logger.write("info", f"entry-{i}-" + ("x" * 20))
+                logger._line_count = 0
+            self.assertTrue(log_file.is_file())
+            self.assertTrue(Path(f"{log_file}.1").is_file())
+
+
 if __name__ == "__main__":
     unittest.main()

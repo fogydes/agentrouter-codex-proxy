@@ -21,26 +21,43 @@ param(
     [int]$Port = 8788,
     [int]$DelaySeconds = 8,
     [int]$MaxLogKB = 1024,
+    [switch]$NoAutoUpdate,
     [switch]$WhatIf_
 )
 
 $ErrorActionPreference = 'Stop'
 
 $root   = Split-Path -Parent $MyInvocation.MyCommand.Path
-$script = Join-Path $root 'start-proxy.ps1'
+$script = Join-Path $root 'service.py'
 
 if (-not (Test-Path $script)) {
-    Write-Host "[fail ] start-proxy.ps1 not found next to this script ($root)" -ForegroundColor Red
+    Write-Host "[fail ] service.py not found next to this script ($root)" -ForegroundColor Red
     exit 1
 }
 
 $account = "$env:USERDOMAIN\$env:USERNAME"
 
-$powershell = (Get-Command powershell.exe -ErrorAction SilentlyContinue).Source
-if (-not $powershell) { $powershell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" }
+# Resolve GUI-subsystem pythonw.exe so Windows Task Scheduler never opens or
+# flashes a console / Windows Terminal window when starting at logon.
+$launcher = Join-Path $root '.venv\Scripts\pythonw.exe'
+if (-not (Test-Path $launcher)) {
+    $launcher = (Get-Command pythonw.exe -ErrorAction SilentlyContinue).Source
+}
+if (-not $launcher) {
+    $pyCmd = (Get-Command python.exe -ErrorAction SilentlyContinue).Source
+    if (-not $pyCmd) { $pyCmd = (Get-Command py.exe -ErrorAction SilentlyContinue).Source }
+    if ($pyCmd) {
+        $candidate = Join-Path (Split-Path -Parent $pyCmd) 'pythonw.exe'
+        if (Test-Path $candidate) { $launcher = $candidate }
+    }
+}
+if (-not $launcher -or -not (Test-Path $launcher)) {
+    Write-Host '[fail ] pythonw.exe not found in .venv\Scripts or on PATH. Install Python 3.10+ first.' -ForegroundColor Red
+    exit 1
+}
 
-$arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Service -Port {1} -MaxLogKB {2}' -f `
-             $script, $Port, $MaxLogKB
+$arguments = '"{0}" --port {1} --max-log-kb {2}' -f $script, $Port, $MaxLogKB
+if ($NoAutoUpdate) { $arguments += ' --no-auto-update' }
 
 Write-Host ''
 Write-Host '  Scheduled task to be registered' -ForegroundColor White
@@ -48,7 +65,8 @@ Write-Host "  name      : $TaskName"        -ForegroundColor DarkGray
 Write-Host "  account   : $account"          -ForegroundColor DarkGray
 Write-Host "  trigger   : at logon, +${DelaySeconds}s delay" -ForegroundColor DarkGray
 Write-Host "  logon     : Interactive -- starts only while you are logged in" -ForegroundColor DarkGray
-Write-Host "  action    : $powershell"       -ForegroundColor DarkGray
+Write-Host "  window    : headless background (pythonw.exe GUI subsystem, no console)" -ForegroundColor DarkGray
+Write-Host "  action    : $launcher"         -ForegroundColor DarkGray
 Write-Host "  arguments : $arguments"        -ForegroundColor DarkGray
 Write-Host "  workdir   : $root"             -ForegroundColor DarkGray
 Write-Host "  listen    : 127.0.0.1:$Port (loopback only)" -ForegroundColor DarkGray
@@ -64,15 +82,19 @@ if ($existing) {
     Write-Host "[warn ] a task named '$TaskName' already exists -- it will be replaced." -ForegroundColor Yellow
 }
 
-$action = New-ScheduledTaskAction -Execute $powershell -Argument $arguments -WorkingDirectory $root
+$action = New-ScheduledTaskAction -Execute $launcher -Argument $arguments -WorkingDirectory $root
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $account
 $trigger.Delay = "PT${DelaySeconds}S"
 $principal = New-ScheduledTaskPrincipal -UserId $account -LogonType Interactive -RunLevel Limited
 
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
                                          -DontStopIfGoingOnBatteries `
-                                         -ExecutionTimeLimit (New-TimeSpan -Days 0) `
-                                         -MultipleInstances Parallel
+                                         -StartWhenAvailable `
+                                         -RestartCount 3 `
+                                         -RestartInterval (New-TimeSpan -Minutes 1) `
+                                         -ExecutionTimeLimit ([TimeSpan]::Zero) `
+                                         -MultipleInstances IgnoreNew
+$settings.Hidden = $true
 
 Register-ScheduledTask -TaskName $TaskName `
                        -Action $action `

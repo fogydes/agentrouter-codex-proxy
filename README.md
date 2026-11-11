@@ -62,17 +62,25 @@ Use the same resource that created the item to access it. [trace_id=...]
 - Python 3.10+
 - Dependencies: `fastapi`, `uvicorn`, `httpx` (installed automatically by `start-proxy.ps1`)
 
-### 2. Quick Start (Interactive)
+### 2. Quick Start (Interactive or Headless Background)
 ```powershell
 cd D:\Projects\agentrouter-codex-proxy
-.\start-proxy.ps1
+.\start-proxy.ps1              # interactive foreground
+.\start-proxy.ps1 -Background  # headless background service (no console window)
+.\start-proxy.ps1 -Update      # check/apply fast-forward git updates before starting
 ```
 
-### 3. Autostart as a Windows Background Task (Recommended)
-Registers a scheduled task that starts automatically when you log in to Windows:
+### 3. Autostart as a Headless Background Task (Recommended)
+Registers a Windows Task Scheduler logon task running `service.py` via GUI-subsystem `pythonw.exe` (no console or Windows Terminal window opens) with automatic rotating logs (`logs/proxy.log`) and a safe fast-forward auto-updater (`updater.py`):
 ```powershell
 cd D:\Projects\agentrouter-codex-proxy
 .\install-autostart.ps1
+```
+To pass `--no-auto-update` or check/apply updates manually:
+```powershell
+.\install-autostart.ps1 -NoAutoUpdate
+python updater.py --check
+python updater.py --apply
 ```
 To remove the background task:
 ```powershell

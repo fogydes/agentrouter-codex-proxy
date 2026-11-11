@@ -16,6 +16,8 @@
       .\start-proxy.ps1                  # interactive, Ctrl+C to stop
       .\start-proxy.ps1 -Port 8788       # default or custom port
       .\start-proxy.ps1 -Verbose_        # extra diagnostics
+      .\start-proxy.ps1 -Background      # launch headless background service
+      .\start-proxy.ps1 -Update          # check/apply fast-forward git updates before starting
       .\start-proxy.ps1 -Service         # supervised, rotating log file
 #>
 
@@ -23,7 +25,11 @@
 param(
     [int]$Port = 8788,
     [switch]$Verbose_,
-    # Set by the scheduled task: log to a rotating file instead of the console.
+    # Launch detached via pythonw.exe (no console window) and return immediately.
+    [switch]$Background,
+    # Check and apply fast-forward git updates before launching.
+    [switch]$Update,
+    # Set by supervisor/CLI: log to a rotating file instead of the console.
     [switch]$Service,
     # Hard ceiling per log file. One previous generation is kept as .1, so
     # total on-disk log usage is bounded at roughly 2 x this value.
@@ -164,6 +170,14 @@ if (Test-Path $venvPython) {
 $pyVersion = & $python --version 2>&1
 Write-Ok "interpreter: $pyVersion"
 
+if ($Update) {
+    $updaterPath = Join-Path $root 'updater.py'
+    if (Test-Path $updaterPath) {
+        Write-Step 'Checking for proxy updates'
+        & $python $updaterPath --apply | ForEach-Object { Write-Line ([string]$_) }
+    }
+}
+
 # ---------------------------------------------------------------------------
 # 3. Verify dependencies
 # ---------------------------------------------------------------------------
@@ -277,6 +291,32 @@ function Invoke-Uvicorn {
         $ErrorActionPreference = $savedPreference
         Stop-OwnUvicorn
     }
+}
+
+if ($Background) {
+    $pythonw = Join-Path (Split-Path -Parent $python) 'pythonw.exe'
+    if (-not (Test-Path $pythonw)) {
+        $pythonw = (Get-Command pythonw.exe -ErrorAction SilentlyContinue).Source
+    }
+    $serviceScript = Join-Path $root 'service.py'
+    if (-not $pythonw -or -not (Test-Path $serviceScript)) {
+        Write-Err 'pythonw.exe or service.py not found for -Background mode.'
+        exit 1
+    }
+    $svcArgs = "`"$serviceScript`" --port $Port --max-log-kb $MaxLogKB"
+    if ($Verbose_) { $svcArgs += ' --verbose' }
+    Start-Process -FilePath $pythonw -ArgumentList $svcArgs -WorkingDirectory $root -WindowStyle Hidden
+    $ready = $false
+    for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep -Milliseconds 300
+        if (Test-OurProxy -OnPort $Port) { $ready = $true; break }
+    }
+    if ($ready) {
+        Write-Ok "proxy running cleanly in headless background mode on http://127.0.0.1:$Port"
+    } else {
+        Write-Warn "background service started; check logs\proxy.log if /_health is not up yet."
+    }
+    exit 0
 }
 
 if ($Service) {
