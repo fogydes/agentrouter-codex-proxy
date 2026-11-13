@@ -42,6 +42,7 @@ import sys
 import time
 from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Tuple
 
+import anyio
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -444,6 +445,7 @@ STATS = {
     "stateless_fallbacks_applied": 0,
     "successful_recoveries": 0,
     "transport_retries": 0,
+    "pool_timeouts": 0,
     "rate_limits_caught": 0,
     "stream_precommit_retries": 0,
     "rate_limit_wait_seconds_total": 0.0,
@@ -715,6 +717,16 @@ def sanitize_responses_payload(payload: dict) -> dict:
 # ----------------------------------------------------------------------------
 # Transport Helper with Automatic Network Reconnects
 # ----------------------------------------------------------------------------
+def describe_upstream_error(exc: Exception) -> str:
+    """Include the error class even when HTTPX supplies an empty message."""
+    detail = str(exc).strip()
+    if isinstance(exc, httpx.PoolTimeout) and not detail:
+        detail = "Timed out waiting for an available upstream connection"
+    detail = re.sub(r"(?i)(bearer\s+)\S+", r"\1[REDACTED]", detail)
+    detail = re.sub(r"sk-[A-Za-z0-9_-]{12,}", "[REDACTED]", detail)
+    return type(exc).__name__ + (": " + detail[:500] if detail else "")
+
+
 async def _send_with_transport_retry(
     client: httpx.AsyncClient,
     method: str,
@@ -756,8 +768,10 @@ async def _send_with_transport_retry(
         except Exception as exc:
             last_exc = exc
             STATS["transport_retries"] += 1
+            if isinstance(exc, httpx.PoolTimeout):
+                STATS["pool_timeouts"] += 1
             backoff_s = min(attempt * 0.75, 4.0)
-            logger.error("[Transport Error %d/%d] %s. Reconnecting in %.1fs...", attempt, max_retries, str(exc), backoff_s)
+            logger.error("[Transport Error %d/%d] %s. Retrying in %.1fs...", attempt, max_retries, describe_upstream_error(exc), backoff_s)
             if attempt < max_retries:
                 await asyncio.sleep(backoff_s)
             else:
@@ -867,14 +881,33 @@ async def _close_sse_producer(
     upstream_response: Optional[httpx.Response],
     producer_task: Optional[asyncio.Task],
 ) -> None:
-    if producer_task is not None and not producer_task.done():
-        producer_task.cancel()
-        await asyncio.gather(producer_task, return_exceptions=True)
-    if upstream_response is not None:
+    # Starlette cancels the entire AnyIO task group on client disconnect. Without
+    # shielding, cancellation can interrupt gather/aclose and leak pool slots.
+    with anyio.CancelScope(shield=True):
+        if producer_task is not None:
+            if not producer_task.done():
+                producer_task.cancel()
+            await asyncio.gather(producer_task, return_exceptions=True)
+        if upstream_response is not None:
+            try:
+                await upstream_response.aclose()
+            except Exception as exc:
+                logger.warning("[Upstream Cleanup] %s", describe_upstream_error(exc))
+
+
+class UpstreamStreamingResponse(StreamingResponse):
+    """Release upstream even if downstream fails before iteration starts."""
+
+    def __init__(self, *args, upstream_response, producer_task=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.upstream_response = upstream_response
+        self.producer_task = producer_task
+
+    async def __call__(self, scope, receive, send):
         try:
-            await upstream_response.aclose()
-        except Exception:
-            pass
+            await super().__call__(scope, receive, send)
+        finally:
+            await _close_sse_producer(self.upstream_response, self.producer_task)
 
 
 def _parse_sse_frame(raw_frame: bytes) -> Tuple[str, Optional[Dict[str, Any]], str]:
@@ -1239,6 +1272,8 @@ async def handle_responses(request: Request):
 
         req_content = json.dumps(active_payload).encode("utf-8") if active_payload is not None else body_bytes
 
+        resp = None
+        stream_handed_off = False
         try:
             client = get_shared_client()
             resp = await _send_with_transport_retry(
@@ -1264,7 +1299,7 @@ async def handle_responses(request: Request):
                             "[Success] Request recovered (fallback=%s, retries=%d)!",
                             fallback_active, transient_retries + mismatch_attempts
                         )
-                    return StreamingResponse(
+                    downstream = UpstreamStreamingResponse(
                         _stream_generator(
                             resp,
                             primed_chunks=prime.primed_chunks,
@@ -1276,7 +1311,11 @@ async def handle_responses(request: Request):
                         status_code=200,
                         headers=resp_headers,
                         media_type="text/event-stream",
+                        upstream_response=resp,
+                        producer_task=prime.producer_task,
                     )
+                    stream_handed_off = True
+                    return downstream
 
                 if prime.status == "client_disconnected":
                     return Response(status_code=499)
@@ -1382,15 +1421,19 @@ async def handle_responses(request: Request):
             return Response(content=err_body, status_code=resp.status_code, headers=resp_headers)
 
         except Exception as exc:
-            logger.error("[Attempt Exception] %s", str(exc))
+            description = describe_upstream_error(exc)
+            logger.error("[Attempt Exception] %s", description)
             last_failure_response = JSONResponse(
                 status_code=502,
-                content={"error": {"message": f"Proxy upstream communication error: {str(exc)}", "type": "proxy_error"}},
+                content={"error": {"message": f"Proxy upstream communication error: {description}", "type": "proxy_error"}},
             )
-            should_retry, _ = await schedule_transient_wait(False, {}, str(exc), "Attempt Exception")
+            should_retry, _ = await schedule_transient_wait(False, {}, description, "Attempt Exception")
             if should_retry:
                 continue
             return last_failure_response
+        finally:
+            if resp is not None and not stream_handed_off:
+                await _close_sse_producer(resp, None)
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def passthrough_handler(request: Request, path: str):
@@ -1424,10 +1467,11 @@ async def passthrough_handler(request: Request, path: str):
         }
         return Response(content=resp.content, status_code=resp.status_code, headers=resp_headers)
     except Exception as exc:
-        logger.error("[Passthrough Error] %s -> %s: %s", request.method, target_url, str(exc))
+        description = describe_upstream_error(exc)
+        logger.error("[Passthrough Error] %s -> %s: %s", request.method, target_url, description)
         return JSONResponse(
             status_code=502,
-            content={"error": {"message": f"Proxy passthrough error: {str(exc)}", "type": "proxy_error"}}
+            content={"error": {"message": f"Proxy passthrough error: {description}", "type": "proxy_error"}}
         )
 
 # ----------------------------------------------------------------------------

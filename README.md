@@ -53,10 +53,13 @@ Use the same resource that created the item to access it. [trace_id=...]
 3. **Pre-Commit SSE Priming & Rate-Limit Recovery**: Buffers initial `200 OK` `text/event-stream` setup frames long enough to catch early `rate_limit_exceeded` / `response.failed` / empty streams before committing headers to Codex, coordinates a shared cooldown + stagger across concurrent subagent calls, and honors `Retry-After` / reset hints before retrying.
 4. **Windows & DNS Resilience**: Provides resilient DNS fallback (`8.214.160.125`, `8.214.161.192`), TCP keep-alive hooks, and a Python 3.12 Windows `ProactorEventLoop` `_call_connection_lost` guard (`WinError 10054`).
 5. **Codex Keeps Streaming**: Codex receives clean `text/event-stream` tokens and `: ping` heartbeats with far fewer interruptions.
+6. **Cancellation Cleanup**: Releases upstream responses even when a client disconnects or downstream delivery fails, preventing leaked connections from exhausting HTTPX's pool.
 
 ---
 
 ## Setup & Usage
+
+For a complete walkthrough, see the [Windows installation guide](docs/windows-installation.md): Python and Git, Codex configuration, per-user or machine-wide startup, health checks, restart, and rollback.
 
 ### 1. Requirements
 - Python 3.10+
@@ -125,7 +128,7 @@ env_key = "CODEX_GATEWAY_API_KEY"
 
 - **Health check**: `http://127.0.0.1:8788/_health`
 - **Proxy stats**: `http://127.0.0.1:8788/_stats`
-  - Returns counts for total requests, mismatches caught, fallbacks applied, rate limits caught, pre-commit stream retries, and successful recoveries.
+  - Returns counts for total requests, mismatches caught, fallbacks applied, rate limits caught, pre-commit stream retries, successful recoveries, and pool timeouts.
 - **Logs**: When running as a service (`-Service` or via scheduled task), logs are stored in `logs/proxy.log` (automatically rotates at 1MB).
 - **Tests**:
   ```powershell
