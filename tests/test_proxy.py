@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 import httpx
 
@@ -82,6 +83,8 @@ class _QueuedMockTransport(httpx.AsyncBaseTransport):
         self.calls.append({
             "method": request.method,
             "url": str(request.url),
+            "headers": dict(request.headers),
+            "content": body_raw,
             "body": body_json,
             "t": time.monotonic(),
         })
@@ -123,6 +126,15 @@ def _reset_proxy_for_test(mock_transport: _QueuedMockTransport, overrides: dict 
     proxy.STATS["successful_recoveries"] = 0
     proxy.STATS["stateless_fallbacks_applied"] = 0
     proxy.STATS["resource_mismatches_caught"] = 0
+    for key in (
+        "responses_upstream_attempts", "requests_with_session_id", "requests_without_session_id",
+        "session_modes_activated", "preemptive_sanitizations", "preemptive_sanitization_skipped",
+        "unsafe_recovery_skipped",
+    ):
+        proxy.STATS[key] = 0
+    for counters in proxy.STATS["clients"].values():
+        for key in counters:
+            counters[key] = 0
     proxy._SHARED_CLIENT = httpx.AsyncClient(transport=mock_transport, timeout=proxy.CLIENT_TIMEOUT)
     proxy.RATE_LIMIT_BASE_DELAY_S = 0.05
     proxy.RATE_LIMIT_MAX_DELAY_S = 0.25
@@ -135,6 +147,79 @@ def _reset_proxy_for_test(mock_transport: _QueuedMockTransport, overrides: dict 
     if overrides:
         for k, v in overrides.items():
             setattr(proxy, k, v)
+
+
+class DnsFallbackTests(unittest.TestCase):
+    """DNS cache and configurable fallbacks for custom upstream hosts."""
+
+    def setUp(self):
+        self._saved_cache = dict(proxy.DYNAMIC_DNS_CACHE)
+        self._saved_env = os.environ.get("PROXY_DNS_FALLBACKS")
+        proxy.DYNAMIC_DNS_CACHE.clear()
+        os.environ.pop("PROXY_DNS_FALLBACKS", None)
+
+    def tearDown(self):
+        proxy.DYNAMIC_DNS_CACHE.clear()
+        proxy.DYNAMIC_DNS_CACHE.update(self._saved_cache)
+        if self._saved_env is None:
+            os.environ.pop("PROXY_DNS_FALLBACKS", None)
+        else:
+            os.environ["PROXY_DNS_FALLBACKS"] = self._saved_env
+
+    @staticmethod
+    def _result(ip="1.2.3.4", port=443):
+        return [(socket.AF_INET, socket.SocketKind.SOCK_STREAM, 6, "", (ip, port))]
+
+    def test_success_caches_every_host_not_only_static_fallbacks(self):
+        with patch.object(proxy, "_ORIG_GETADDRINFO", return_value=self._result()):
+            proxy.resilient_getaddrinfo("random.example", 443)
+        self.assertIn("random.example", proxy.DYNAMIC_DNS_CACHE)
+
+    def test_failure_uses_cached_result_with_requested_port(self):
+        with patch.object(proxy, "_ORIG_GETADDRINFO", return_value=self._result("5.6.7.8")):
+            proxy.resilient_getaddrinfo("cached.example", 443)
+
+        with patch.object(proxy, "_ORIG_GETADDRINFO", side_effect=socket.gaierror(-3, "temporary")):
+            result = proxy.resilient_getaddrinfo("cached.example", 8443)
+        self.assertEqual(result[0][4], ("5.6.7.8", 8443))
+
+    def test_failure_uses_env_configured_fallbacks_case_and_dot_insensitive(self):
+        os.environ["PROXY_DNS_FALLBACKS"] = "ps.air-outer.com:8.214.160.125, 8.214.161.192"
+        with patch.object(proxy, "_ORIG_GETADDRINFO", side_effect=socket.gaierror(-3, "temporary")):
+            result = proxy.resilient_getaddrinfo("PS.AIR-OUTER.COM.", 443)
+        self.assertEqual([r[4][0] for r in result], ["8.214.160.125", "8.214.161.192"])
+
+    def test_invalid_fallback_ip_is_ignored(self):
+        os.environ["PROXY_DNS_FALLBACKS"] = "x.example:not-an-ip,9.9.9.9"
+        with patch.object(proxy, "_ORIG_GETADDRINFO", side_effect=socket.gaierror(-3, "temporary")):
+            result = proxy.resilient_getaddrinfo("x.example", 443)
+        self.assertEqual([r[4][0] for r in result], ["9.9.9.9"])
+
+    def test_builtin_fallbacks_still_work(self):
+        with patch.object(proxy, "_ORIG_GETADDRINFO", side_effect=socket.gaierror(-3, "temporary")):
+            result = proxy.resilient_getaddrinfo("agentrouter.org", 443)
+        self.assertEqual([r[4][0] for r in result], ["8.214.160.125", "8.214.161.192"])
+
+    def test_unknown_host_without_fallback_still_raises(self):
+        with patch.object(proxy, "_ORIG_GETADDRINFO", side_effect=socket.gaierror(-3, "temporary")):
+            with self.assertRaises(socket.gaierror):
+                proxy.resilient_getaddrinfo("unknown.example", 443)
+
+
+class TimeoutConfigTests(unittest.TestCase):
+    """All httpx/uvicorn timeout knobs are configurable and consistent."""
+
+    def test_client_timeout_uses_configurable_components(self):
+        self.assertEqual(proxy.CLIENT_TIMEOUT.connect, proxy.CONNECT_TIMEOUT_S)
+        self.assertEqual(proxy.CLIENT_TIMEOUT.read, proxy.READ_TIMEOUT_S)
+        self.assertEqual(proxy.CLIENT_TIMEOUT.write, proxy.WRITE_TIMEOUT_S)
+        self.assertEqual(proxy.CLIENT_TIMEOUT.pool, proxy.POOL_TIMEOUT_S)
+
+    def test_write_timeout_default_is_not_the_old_hardcoded_60s(self):
+        self.assertGreater(proxy.WRITE_TIMEOUT_S, 60.0)
+
+    def test_keepalive_timeout_default(self):
+        self.assertEqual(proxy.KEEPALIVE_TIMEOUT_S, 600.0)
 
 
 class ProactorTeardownTests(unittest.TestCase):
@@ -291,7 +376,6 @@ class ProxyRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         payload = {
             "model": "gpt-6.1-sol",
-            "previous_response_id": "resp_old",
             "input": [{"type": "reasoning", "id": "rs_1"}, {"type": "message", "id": "msg_1", "role": "user", "content": "hi"}],
             "stream": True,
         }
@@ -448,7 +532,9 @@ class ProxyRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 async def send(_msg):
                     pass
 
-                await sr({}, receive, send)
+                # Starlette 1.x requires the ASGI scope type; older supported
+                # releases accepted an empty mapping here.
+                await sr({"type": "http"}, receive, send)
                 self.assertTrue(resp.is_closed)
         finally:
             await client.aclose()

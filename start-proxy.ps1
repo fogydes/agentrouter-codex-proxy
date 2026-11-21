@@ -8,7 +8,7 @@
       0. Refuses to start a second instance on an already-healthy port.
       1. Loads .env if one is present (values are never printed).
       2. Activates .venv if one is present, else falls back to system Python.
-      3. Verifies fastapi / uvicorn / httpx are importable.
+      3. Verifies fastapi / uvicorn / httpx / zstandard are importable.
       4. Verifies a credential exists WITHOUT printing it.
       5. Starts uvicorn bound to $BindHost (default 127.0.0.1 loopback only).
 
@@ -204,12 +204,12 @@ if ($Update) {
 # ---------------------------------------------------------------------------
 # 3. Verify dependencies
 # ---------------------------------------------------------------------------
-Write-Step 'Verifying dependencies (fastapi, uvicorn, httpx)'
+Write-Step 'Verifying dependencies (fastapi, uvicorn, httpx, zstandard)'
 
 $checkScript = @'
 import importlib, sys
 missing = []
-for mod in ("fastapi", "uvicorn", "httpx"):
+for mod in ("fastapi", "uvicorn", "httpx", "zstandard"):
     try:
         m = importlib.import_module(mod)
         print(f"  {mod:<8} {getattr(m, '__version__', 'unknown')}")

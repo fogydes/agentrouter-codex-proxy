@@ -187,7 +187,7 @@ def _ensure_dependencies(worker_python: str, logger: RotatingFileLogger) -> bool
             worker_python,
             "-c",
             "import importlib.util, sys; "
-            "sys.exit(3 if any(importlib.util.find_spec(m) is None for m in ('fastapi','uvicorn','httpx')) else 0)",
+            "sys.exit(3 if any(importlib.util.find_spec(m) is None for m in ('fastapi','uvicorn','httpx','zstandard')) else 0)",
         ],
         **_subprocess_kwargs(pipe_output=True),
         timeout=30,
@@ -197,10 +197,10 @@ def _ensure_dependencies(worker_python: str, logger: RotatingFileLogger) -> bool
 
     req_path = ROOT / "requirements.txt"
     if not req_path.is_file():
-        logger.write("fail ", "missing dependencies (fastapi/uvicorn/httpx) and requirements.txt not found")
+        logger.write("fail ", "missing dependencies (fastapi/uvicorn/httpx/zstandard) and requirements.txt not found")
         return False
 
-    logger.write("warn ", "missing dependencies (fastapi/uvicorn/httpx); installing from requirements.txt")
+    logger.write("warn ", "missing dependencies (fastapi/uvicorn/httpx/zstandard); installing from requirements.txt")
     cmd = [worker_python, "-m", "pip", "install", "--disable-pip-version-check", "-q", "-r", str(req_path)]
     proc = subprocess.run(cmd, **_subprocess_kwargs(pipe_output=True), timeout=180)
     if proc.returncode != 0:
@@ -406,7 +406,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "--port",
                 str(args.port),
                 "--timeout-keep-alive",
-                "600",
+                str(int(float(os.environ.get("PROXY_KEEPALIVE_TIMEOUT_S", "600")))),
                 "--log-level",
                 "warning",
                 "--no-access-log",

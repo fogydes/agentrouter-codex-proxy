@@ -41,11 +41,17 @@ import re
 import socket
 import sys
 import time
-from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Tuple
+from typing import Any, AsyncIterator, Callable, Dict, List, Mapping, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+
+from request_payloads import RequestPayloadError, available_request_encodings, parse_responses_payload
+from session_modes import (
+    CLIENTS, SESSION_ID_HEADER, SessionIdentity, SessionModeStore, detect_client,
+    extract_session_identity, valid_client_session_id,
+)
 
 # ----------------------------------------------------------------------------
 # Logging Setup
@@ -69,49 +75,114 @@ def _format_exc(exc: BaseException) -> str:
 # ----------------------------------------------------------------------------
 _ORIG_GETADDRINFO = socket.getaddrinfo
 
-# Pre-seeded fallback IP addresses for upstream hosts
+# Built-in fallback IPs for the official AgentRouter domains only. Custom
+# upstreams (for example a China-region relay) can declare their own fallback
+# IPs through the PROXY_DNS_FALLBACKS environment variable; see _dns_fallback_ips.
 STATIC_DNS_FALLBACKS: Dict[str, List[str]] = {
     "agentrouter.org": ["8.214.160.125", "8.214.161.192"],
     "api.agentrouter.org": ["8.214.160.125", "8.214.161.192"],
 }
 
-# Dynamic in-memory DNS cache: updated whenever system DNS succeeds
+# Dynamic in-memory DNS cache: every successfully resolved host is cached, so a
+# transient resolver outage cannot break an upstream that already worked once.
 DYNAMIC_DNS_CACHE: Dict[str, List[tuple]] = {}
+_DNS_CACHE_MAX_HOSTS = 256
+
+
+def _parse_dns_fallbacks(raw: str) -> Dict[str, List[str]]:
+    """Parse PROXY_DNS_FALLBACKS: 'host:ip,ip;other-host:ip'.
+
+    Host names are normalized (lowercase, trailing dot removed) and IPs are
+    validated with ipaddress, so malformed entries never reach getaddrinfo.
+    """
+    parsed: Dict[str, List[str]] = {}
+    for entry in (raw or "").split(";"):
+        entry = entry.strip()
+        if not entry or ":" not in entry:
+            continue
+        host, _, ip_text = entry.partition(":")
+        host = host.strip().lower().rstrip(".")
+        if not host:
+            continue
+        addresses: List[str] = []
+        for candidate in ip_text.split(","):
+            candidate = candidate.strip()
+            if not candidate:
+                continue
+            try:
+                ipaddress.ip_address(candidate)
+            except ValueError:
+                logger.warning("[DNS Fallback] Ignoring invalid fallback IP %r for %s", candidate, host)
+                continue
+            if candidate not in addresses:
+                addresses.append(candidate)
+        if addresses:
+            parsed[host] = addresses
+    return parsed
+
+
+def _dns_fallback_ips(host: str) -> List[str]:
+    """Built-in plus environment-configured fallback IPs for one host.
+
+    The environment is read on every call because _load_env() runs after this
+    module-level code, and because the upstream may be changed at runtime.
+    """
+    ips = list(STATIC_DNS_FALLBACKS.get(host, ()))
+    for ip in _parse_dns_fallbacks(os.environ.get("PROXY_DNS_FALLBACKS", "")).get(host, ()):
+        if ip not in ips:
+            ips.append(ip)
+    return ips
+
 
 def resilient_getaddrinfo(host, port, *args, **kwargs):
     """
-    Bulletproof getaddrinfo hook:
-    1. Attempts standard OS getaddrinfo first.
-    2. On success, updates DYNAMIC_DNS_CACHE.
-    3. On failure (socket.gaierror), falls back to DYNAMIC_DNS_CACHE or STATIC_DNS_FALLBACKS.
+    Resolve with a bounded cache and configurable fallbacks:
+    1. Try the OS resolver; on success cache the result for EVERY host.
+    2. On a transient resolver failure, reuse the last good result.
+    3. If nothing was cached, use built-in or PROXY_DNS_FALLBACKS IPs.
     """
     if isinstance(host, (bytes, bytearray)):
         host_str = host.decode("utf-8", errors="ignore")
     else:
         host_str = str(host)
+    host_key = host_str.lower().rstrip(".")
 
     try:
         results = _ORIG_GETADDRINFO(host, port, *args, **kwargs)
-        if results and host_str in STATIC_DNS_FALLBACKS:
-            DYNAMIC_DNS_CACHE[host_str] = results
+        if results:
+            if host_key not in DYNAMIC_DNS_CACHE and len(DYNAMIC_DNS_CACHE) >= _DNS_CACHE_MAX_HOSTS:
+                DYNAMIC_DNS_CACHE.pop(next(iter(DYNAMIC_DNS_CACHE)), None)
+            DYNAMIC_DNS_CACHE[host_key] = results
         return results
-    except socket.gaierror as exc:
-        # Check if we have cached results from earlier successful queries
-        if host_str in DYNAMIC_DNS_CACHE:
-            cached = []
-            for item in DYNAMIC_DNS_CACHE[host_str]:
-                cached.append((item[0], item[1], item[2], item[3], (item[4][0], port)))
-            logger.warning("[DNS Fallback] getaddrinfo failed for %s. Using cached IPs: %s", host_str, [x[4][0] for x in cached])
-            return cached
+    except socket.gaierror:
+        cached = DYNAMIC_DNS_CACHE.get(host_key)
+        if cached:
+            rebuilt = []
+            for item in cached:
+                sockaddr = item[4]
+                if item[0] == socket.AF_INET and isinstance(sockaddr, tuple) and sockaddr:
+                    rebuilt.append((item[0], item[1], item[2], item[3], (sockaddr[0], port)))
+                elif item[0] == socket.AF_INET6 and isinstance(sockaddr, tuple) and len(sockaddr) >= 4:
+                    rebuilt.append((item[0], item[1], item[2], item[3], (sockaddr[0], port, sockaddr[2], sockaddr[3])))
+                else:
+                    rebuilt.append(item)
+            if rebuilt:
+                logger.warning(
+                    "[DNS Fallback] Resolver failed for %s; using %d cached address(es)",
+                    host_str, len(rebuilt),
+                )
+                return rebuilt
 
-        # Check if we have static fallback IPs
-        if host_str in STATIC_DNS_FALLBACKS:
-            fallback_ips = STATIC_DNS_FALLBACKS[host_str]
-            logger.warning("[DNS Fallback] getaddrinfo failed for %s. Using static fallback IPs: %s", host_str, fallback_ips)
-            results = []
-            for ip in fallback_ips:
-                results.append((socket.AF_INET, socket.SocketKind.SOCK_STREAM, 6, "", (ip, port)))
-            return results
+        fallback_ips = _dns_fallback_ips(host_key)
+        if fallback_ips:
+            logger.warning(
+                "[DNS Fallback] Resolver failed for %s; using configured fallback IPs: %s",
+                host_str, fallback_ips,
+            )
+            return [
+                (socket.AF_INET, socket.SocketKind.SOCK_STREAM, 6, "", (ip, port))
+                for ip in fallback_ips
+            ]
 
         raise
 
@@ -171,9 +242,14 @@ def _install_proactor_teardown_guard() -> None:
             return
         try:
             orig_call_connection_lost(self, exc)
-        except OSError:
-            if getattr(self, "_called_connection_lost", False):
-                raise
+        except OSError as caught:
+            # A protocol callback failure is not the benign socket-shutdown
+            # reset this guard exists for. CPython's finally block may already
+            # have detached everything, so distinguish it from shutdown()
+            # failure by whether _sock was cleared before the exception escaped.
+            if getattr(self, "_sock", None) is None:
+                self._called_connection_lost = True
+                raise caught
             sock = getattr(self, "_sock", None)
             if sock is not None:
                 try:
@@ -285,6 +361,17 @@ LISTEN_HOST, PORT = _extract_uvicorn_bind_overrides(sys.argv, LISTEN_HOST, PORT)
 RETRY_DELAY_MS = int(os.environ.get("PROXY_RETRY_DELAY_MS", "300"))
 VERBOSE = os.environ.get("PROXY_VERBOSE", "1") not in ("0", "", "false", "False")
 
+# Native client session IDs are distinct from parent/session-affinity IDs.
+SESSION_MODE_MEMORY = os.environ.get("PROXY_SESSION_MODE_MEMORY", "1").strip().lower() not in (
+    "0", "", "false", "no", "off"
+)
+SESSION_MODES = SessionModeStore(
+    Path(__file__).resolve().parent / "logs" / "session_modes.json", UPSTREAM
+)
+MAX_RESPONSES_REQUEST_BYTES = max(
+    1024, int(os.environ.get("PROXY_MAX_REQUEST_BYTES", str(64 * 1024 * 1024)))
+)
+
 # Rate-limit / SSE priming configuration
 RATE_LIMIT_BASE_DELAY_S = float(os.environ.get("PROXY_RATE_LIMIT_BASE_S", "2.0"))
 RATE_LIMIT_MAX_DELAY_S = float(os.environ.get("PROXY_RATE_LIMIT_MAX_DELAY_S", "15.0"))
@@ -296,20 +383,34 @@ SSE_PRIME_CREATED_GRACE_S = float(os.environ.get("PROXY_SSE_PRIME_CREATED_GRACE_
 
 CONNECT_TIMEOUT_S = float(os.environ.get("PROXY_CONNECT_TIMEOUT_S", "20.0"))
 READ_TIMEOUT_S = float(os.environ.get("PROXY_READ_TIMEOUT_S", "600.0"))
+# Write covers uploading the request body to upstream. Large payloads (up to
+# PROXY_MAX_REQUEST_BYTES) on slow links need far more than the old hardcoded
+# 60s, which showed up as spurious 502 "Proxy upstream communication error".
+WRITE_TIMEOUT_S = float(os.environ.get("PROXY_WRITE_TIMEOUT_S", "180.0"))
+# Pool covers waiting for a free connection when all upstream slots are busy.
+POOL_TIMEOUT_S = float(os.environ.get("PROXY_POOL_TIMEOUT_S", "30.0"))
+# Uvicorn idle keep-alive between client requests (seconds).
+KEEPALIVE_TIMEOUT_S = float(os.environ.get("PROXY_KEEPALIVE_TIMEOUT_S", "600.0"))
 
 CLIENT_TIMEOUT = httpx.Timeout(
     timeout=READ_TIMEOUT_S,
     connect=CONNECT_TIMEOUT_S,
     read=READ_TIMEOUT_S,
-    write=60.0,
-    pool=30.0,
+    write=WRITE_TIMEOUT_S,
+    pool=POOL_TIMEOUT_S,
 )
 
-# Match patterns for cross-resource Azure OpenAI error & invalid state references
-RESOURCE_MISMATCH_PATTERNS = [
+# Only these errors permanently switch a session to preemptive sanitization.
+CROSS_RESOURCE_MISMATCH_PATTERNS = [
     re.compile(r"created under a different.*OpenAI resource", re.IGNORECASE),
     re.compile(r"Use the same resource that created the item", re.IGNORECASE),
     re.compile(r"requested item was created under a different", re.IGNORECASE),
+]
+
+# Broader errors may still use the original per-request recovery without marking
+# the session (notably image limits and missing response references).
+RESOURCE_MISMATCH_PATTERNS = [
+    *CROSS_RESOURCE_MISMATCH_PATTERNS,
     re.compile(r"previous_response_id", re.IGNORECASE),
     re.compile(r"Response.*not found", re.IGNORECASE),
     re.compile(r"No response found", re.IGNORECASE),
@@ -448,6 +549,13 @@ def prune_excess_images(payload: dict, max_images: int = MAX_IMAGES_PER_REQUEST)
 STATS = {
     "requests_total": 0,
     "responses_requests": 0,
+    "responses_upstream_attempts": 0,
+    "requests_with_session_id": 0,
+    "requests_without_session_id": 0,
+    "session_modes_activated": 0,
+    "preemptive_sanitizations": 0,
+    "preemptive_sanitization_skipped": 0,
+    "unsafe_recovery_skipped": 0,
     "resource_mismatches_caught": 0,
     "stateless_fallbacks_applied": 0,
     "successful_recoveries": 0,
@@ -456,6 +564,10 @@ STATS = {
     "stream_precommit_retries": 0,
     "rate_limit_wait_seconds_total": 0.0,
     "images_pruned_total": 0,
+    "clients": {
+        client: {"requests": 0, "identified_requests": 0, "preemptive_sanitizations": 0, "modes_activated": 0}
+        for client in (*CLIENTS, "unknown")
+    },
     "start_time": time.time(),
 }
 
@@ -636,6 +748,72 @@ def is_resource_mismatch_text(text: str) -> bool:
     """Checks if error text matches cross-resource item mismatch or image limit patterns."""
     return any(pat.search(text) for pat in RESOURCE_MISMATCH_PATTERNS)
 
+def is_cross_resource_mismatch_text(text: str) -> bool:
+    return any(pat.search(text) for pat in CROSS_RESOURCE_MISMATCH_PATTERNS)
+
+def remember_cross_resource_session(session_id: Optional[SessionIdentity], text: str) -> None:
+    if SESSION_MODE_MEMORY and session_id and is_cross_resource_mismatch_text(text):
+        if SESSION_MODES.mark_sanitized(session_id):
+            STATS["session_modes_activated"] += 1
+            STATS["clients"][session_id.client]["modes_activated"] += 1
+            logger.info(
+                "[Session Mode] client=%s session=%s switched to persistent sanitization",
+                session_id.client, SESSION_MODES.key_for(session_id)[:12],
+            )
+
+CALL_ITEM_TYPES = frozenset({
+    "function_call", "custom_tool_call", "computer_call", "local_shell_call",
+    "shell_call", "apply_patch_call", "mcp_call",
+})
+
+
+def preemptive_block_reason(payload: Any) -> str:
+    """Explain why a payload cannot be rebuilt as a self-contained request.
+
+    Returns "" when sanitization is safe. Clients must replay messages and
+    matching tool calls, not only references or tool outputs whose original
+    calls live exclusively on the server. Outputs that carry no ``call_id`` at
+    all (for example Codex-injected "agent" namespace results) are not
+    call-correlated; upstream accepts them with or without their item id, so
+    they must not block sanitization.
+    """
+    if not isinstance(payload, dict) or not isinstance(payload.get("input"), (list, str)):
+        return "payload has no replayable 'input'"
+    for key in (
+        "previous_response_id", "response_id", "parent_id", "parent_response_id", "conversation"
+    ):
+        if payload.get(key):
+            return f"server-side state pointer {key!r}"
+    if not isinstance(payload["input"], list):
+        return ""
+    called = set()
+    for item in payload["input"]:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("type")
+        if not isinstance(kind, str):
+            continue
+        if kind in ("item_reference", "compaction"):
+            # Opaque compaction checkpoints cannot be reconstructed by stripping IDs.
+            return f"{kind!r} item"
+        if "encrypted_content" in item and kind != "reasoning":
+            return f"opaque encrypted_content on {kind!r}"
+        if kind in CALL_ITEM_TYPES and isinstance(item.get("call_id"), str):
+            called.add(item["call_id"])
+        elif kind.endswith("_call_output"):
+            if "call_id" in item:
+                call_id = item.get("call_id")
+                if not isinstance(call_id, str) or not call_id:
+                    return f"malformed {kind} call_id"
+                if call_id not in called:
+                    return f"orphan {kind} for call_id {call_id!r}"
+    return ""
+
+
+def can_preemptively_sanitize(payload: Any) -> bool:
+    """True when the payload can be made stateless without losing context."""
+    return not preemptive_block_reason(payload)
+
 def is_resource_mismatch_error(status_code: int, body_text: str) -> bool:
     """Checks if an HTTP error response is due to cross-resource item mismatch or image limit."""
     return status_code == 400 and is_resource_mismatch_text(body_text)
@@ -749,6 +927,8 @@ async def _send_with_transport_retry(
                 params=params,
                 content=content,
             )
+            if method.upper() == "POST" and url == f"{UPSTREAM}/v1/responses":
+                STATS["responses_upstream_attempts"] += 1
             return await client.send(req, stream=stream)
         except (httpx.TransportError, httpx.TimeoutException) as exc:
             last_exc = exc
@@ -802,7 +982,7 @@ async def _app_lifespan(_: FastAPI):
 
 app = FastAPI(
     title="agentrouter-codex-proxy",
-    description="Local compatibility proxy fixing OpenAI Responses cross-resource errors for Codex",
+    description="Session-aware HTTP Responses compatibility proxy for OpenCode, Codex, and DeepSeek Harness",
     version="1.5.0",
     lifespan=_app_lifespan,
 )
@@ -842,12 +1022,51 @@ async def health():
         "listen": f"{LISTEN_HOST}:{PORT}",
         "uptime_seconds": uptime_s,
         "upstream": UPSTREAM,
+        "request_encodings": available_request_encodings(),
+        "max_request_bytes": MAX_RESPONSES_REQUEST_BYTES,
+        "websocket_transport": False,
+        "session_mode_memory": {
+            "enabled": SESSION_MODE_MEMORY,
+            "identity_header": SESSION_ID_HEADER,
+            "supported_clients": list(CLIENTS),
+            "identity_sources": {
+                "opencode": "x-opencode-session-id",
+                "codex": "thread-id / Codex thread metadata; legacy UUID session-id",
+                "dsh": "DSH-attributed session_id / session-id / x-session-id / x-client-request-id",
+                "generic": "x-agentrouter-client + x-agentrouter-session-id",
+            },
+            "marked_sessions": SESSION_MODES.count,
+            "persistence_ok": SESSION_MODES.persistence_ok,
+        },
         "stats": STATS,
     }
 
 @app.get("/_stats")
 async def stats():
     return STATS
+
+@app.post("/_session/mode")
+@app.post("/_session/reset")
+async def manage_session_mode(request: Request):
+    """Local diagnostics/reset; never accept administration from LAN callers."""
+    if not request.client or not is_loopback_host(request.client.host):
+        return JSONResponse(status_code=403, content={"error": "Loopback access required"})
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Expected a JSON session_id"})
+    session_id = data.get("session_id") if isinstance(data, dict) else None
+    client = data.get("client", "opencode") if isinstance(data, dict) else None
+    if not valid_client_session_id(client, session_id):
+        return JSONResponse(status_code=400, content={"error": "Expected a supported client and valid session_id"})
+    identity = SessionIdentity(client, session_id)
+    reset = SESSION_MODES.reset(identity) if request.url.path == "/_session/reset" else False
+    return {
+        "client": client,
+        "mode": "sanitize" if SESSION_MODE_MEMORY and SESSION_MODES.should_sanitize(identity) else "passthrough",
+        "reset": reset,
+        "persistence_ok": SESSION_MODES.persistence_ok,
+    }
 
 @dataclass
 class SSEPrimeResult:
@@ -1105,6 +1324,7 @@ async def _stream_generator(
     queue: Optional[asyncio.Queue] = None,
     producer_task: Optional[asyncio.Task] = None,
     producer_exc: Optional[List[Exception]] = None,
+    on_cross_resource_error: Optional[Callable[[str], None]] = None,
     ping_interval: float = 15.0,
 ) -> AsyncIterator[bytes]:
     """
@@ -1117,14 +1337,39 @@ async def _stream_generator(
         producer_task = asyncio.create_task(_sse_producer(upstream_response, queue, producer_exc))
 
     last_event_seen = False
+    inspection_buffer = bytearray()
+    inspected_cross_resource_error = False
+
+    def inspect_chunk(chunk: bytes) -> None:
+        # A late SSE error cannot safely retry an already-visible response, but
+        # it must still switch this session's FUTURE requests. Do not alter SSE.
+        nonlocal inspected_cross_resource_error
+        if on_cross_resource_error is None or inspected_cross_resource_error:
+            return
+        inspection_buffer.extend(chunk)
+        pos = 0
+        for match in SSE_DELIM_RE.finditer(inspection_buffer):
+            raw_frame = bytes(inspection_buffer[pos:match.end()])
+            pos = match.end()
+            kind, _, message, _ = _classify_sse_frame(raw_frame)
+            if kind == "error" and is_cross_resource_mismatch_text(message):
+                inspected_cross_resource_error = True
+                on_cross_resource_error(message)
+        if pos:
+            del inspection_buffer[:pos]
+        # Bound diagnostic-only buffering for malformed/oversized SSE frames.
+        if len(inspection_buffer) > 2 * 1024 * 1024:
+            inspection_buffer.clear()
 
     try:
         for pre in primed_chunks or ():
             if pre:
+                inspect_chunk(pre)
                 if b"response.completed" in pre:
                     last_event_seen = True
                 yield pre
         if remainder:
+            inspect_chunk(remainder)
             if b"response.completed" in remainder:
                 last_event_seen = True
             yield remainder
@@ -1133,7 +1378,10 @@ async def _stream_generator(
             try:
                 chunk = await asyncio.wait_for(queue.get(), timeout=ping_interval)
                 if chunk is None:
+                    if inspection_buffer:
+                        inspect_chunk(b"\n\n")
                     break
+                inspect_chunk(chunk)
                 if b"response.completed" in chunk:
                     last_event_seen = True
                 yield chunk
@@ -1174,29 +1422,58 @@ def _rate_limit_error_response(
 @app.post("/responses")
 async def handle_responses(request: Request):
     """
-    Main handler for Codex /v1/responses.
+    Shared HTTP Responses handler for OpenCode, Codex, and DeepSeek Harness.
     Performs pre-commit SSE priming, staggered rate-limit recovery, and stateless
     sanitization fallback on cross-resource mismatches.
     """
     STATS["requests_total"] += 1
     STATS["responses_requests"] += 1
 
-    body_bytes = await request.body()
+    body_parts = bytearray()
     try:
-        body_json = json.loads(body_bytes.decode("utf-8"))
-    except Exception:
-        body_json = None
+        async for chunk in request.stream():
+            body_parts.extend(chunk)
+            if len(body_parts) > MAX_RESPONSES_REQUEST_BYTES:
+                raise RequestPayloadError(413, "Responses request exceeds the size limit")
+        body_bytes = bytes(body_parts)
+        body_json = parse_responses_payload(
+            body_bytes, request.headers.get("content-encoding", ""), MAX_RESPONSES_REQUEST_BYTES
+        )
+    except RequestPayloadError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": {"message": str(exc), "type": "proxy_request_error"}})
+    finally:
+        body_parts.clear()
+
+    if VERBOSE:
+        _input = body_json.get("input") if isinstance(body_json, dict) else None
+        logger.info(
+            "[Request] responses body=%.2f MB content-encoding=%s input_items=%s",
+            len(body_bytes) / 1e6,
+            request.headers.get("content-encoding") or "identity",
+            len(_input) if isinstance(_input, list) else "n/a",
+        )
 
     headers = _filter_headers(dict(request.headers))
+    session_id = extract_session_identity(request.headers, body_json)
+    client_label = session_id.client if session_id else detect_client(request.headers, body_json)
+    STATS["clients"][client_label]["requests"] += 1
+    if session_id:
+        STATS["clients"][client_label]["identified_requests"] += 1
+    STATS["requests_with_session_id" if session_id else "requests_without_session_id"] += 1
+    # Read the native ID without changing the client's existing routing headers.
     upstream_url = f"{UPSTREAM}/v1/responses"
 
     active_payload = body_json
     fallback_active = False
+    preemptive_active = False
+    preemptive_skip_recorded = False
+    payload_changed = False
 
     # Preemptive check: prune excess historical images before sending upstream.
-    if active_payload and isinstance(active_payload.get("input"), list):
+    if isinstance(active_payload, dict) and isinstance(active_payload.get("input"), list):
         active_payload, pre_pruned = prune_excess_images(active_payload, max_images=MAX_IMAGES_PER_REQUEST)
         if pre_pruned > 0:
+            payload_changed = True
             STATS["images_pruned_total"] += pre_pruned
             logger.warning(
                 "[Preemptive Image Pruning] Pruned %d historical images (kept %d latest) to prevent 50-image ceiling rejection",
@@ -1210,11 +1487,21 @@ async def handle_responses(request: Request):
     last_failure_response: Optional[Response] = None
 
     def activate_stateless_fallback(source_label: str, detail: str) -> bool:
-        nonlocal fallback_active, active_payload, mismatch_attempts
+        nonlocal fallback_active, active_payload, mismatch_attempts, payload_changed
         STATS["resource_mismatches_caught"] += 1
         logger.warning("[Resource Mismatch] %s: %s", source_label, detail[:160])
-        if not fallback_active and body_json is not None:
+        remember_cross_resource_session(session_id, detail)
+        if not fallback_active and not preemptive_active and isinstance(body_json, dict):
+            block_reason = preemptive_block_reason(active_payload)
+            if block_reason:
+                STATS["unsafe_recovery_skipped"] += 1
+                logger.warning(
+                    "[Recovery] Cannot rebuild history (%s); forwarding error without losing context",
+                    block_reason,
+                )
+                return False
             fallback_active = True
+            payload_changed = True
             STATS["stateless_fallbacks_applied"] += 1
             active_payload = sanitize_responses_payload(
                 active_payload if active_payload is not None else body_json
@@ -1223,6 +1510,11 @@ async def handle_responses(request: Request):
             return True
         mismatch_attempts += 1
         return mismatch_attempts <= max_mismatch_retries
+
+    def remember_late_stream_error(message: str) -> None:
+        STATS["resource_mismatches_caught"] += 1
+        remember_cross_resource_session(session_id, message)
+        logger.warning("[Resource Mismatch] Late SSE error; remembered mode for subsequent requests")
 
     async def schedule_transient_wait(
         is_rate_limit: bool,
@@ -1259,7 +1551,46 @@ async def handle_responses(request: Request):
         if not await _wait_for_rate_limit_gate(request):
             return Response(status_code=499)
 
-        req_content = json.dumps(active_payload).encode("utf-8") if active_payload is not None else body_bytes
+        # Recheck immediately before dispatch: another concurrent request may
+        # have marked this exact session while this request waited at the gate.
+        if SESSION_MODE_MEMORY and session_id and not fallback_active and not preemptive_active:
+            if SESSION_MODES.should_sanitize(session_id):
+                if can_preemptively_sanitize(active_payload):
+                    active_payload = sanitize_responses_payload(active_payload)
+                    payload_changed = True
+                    preemptive_active = True
+                    STATS["preemptive_sanitizations"] += 1
+                    STATS["clients"][client_label]["preemptive_sanitizations"] += 1
+                    logger.info(
+                        "[Session Mode] client=%s session=%s preemptively sanitized before first upstream attempt",
+                        client_label, SESSION_MODES.key_for(session_id)[:12],
+                    )
+                elif not preemptive_skip_recorded:
+                    preemptive_skip_recorded = True
+                    STATS["preemptive_sanitization_skipped"] += 1
+                    logger.warning(
+                        "[Session Mode] Cannot sanitize yet (%s); retaining reactive recovery",
+                        preemptive_block_reason(active_payload) or "unknown",
+                    )
+
+        # Healthy requests retain their exact bytes, including compression. A
+        # rewritten request is plain UTF-8 JSON, so NEVER keep content-encoding
+        # (or the stale content-length): the upstream relays do not decode
+        # proxy-added zstd/gzip bodies and would fail JSON parsing.
+        # ASCII escapes also preserve escaped Unicode from the original JSON
+        # without letting an unpaired surrogate cause a local codec failure.
+        req_content = body_bytes
+        req_headers = headers
+        if payload_changed:
+            req_content = json.dumps(active_payload).encode("utf-8")
+            req_headers = {
+                k: v for k, v in headers.items()
+                if k.lower() not in (
+                    "content-encoding", "content-length", "content-md5",
+                    "digest", "content-digest", "repr-digest",
+                )
+            }
+            req_headers["content-type"] = "application/json"
 
         try:
             client = get_shared_client()
@@ -1267,7 +1598,7 @@ async def handle_responses(request: Request):
                 client,
                 method="POST",
                 url=upstream_url,
-                headers=headers,
+                headers=req_headers,
                 content=req_content,
                 stream=True,
                 max_retries=5,
@@ -1287,7 +1618,8 @@ async def handle_responses(request: Request):
                             STATS["successful_recoveries"] += 1
                             logger.info(
                                 "[Success] Request recovered (fallback=%s, retries=%d)!",
-                                fallback_active, transient_retries + mismatch_attempts
+                                fallback_active,
+                                transient_retries + mismatch_attempts + int(fallback_active),
                             )
                         stream_handed_off = True
                         return StreamingResponse(
@@ -1298,6 +1630,9 @@ async def handle_responses(request: Request):
                                 queue=prime.queue,
                                 producer_task=prime.producer_task,
                                 producer_exc=prime.producer_exc,
+                                on_cross_resource_error=(
+                                    remember_late_stream_error if SESSION_MODE_MEMORY and session_id else None
+                                ),
                             ),
                             status_code=200,
                             headers=resp_headers,
@@ -1313,8 +1648,11 @@ async def handle_responses(request: Request):
                             continue
                         return JSONResponse(
                             status_code=400,
-                            content={"error": prime.error_payload or {"message": prime.error_message, "code": prime.error_code}},
-                            headers=resp_headers,
+                            content={
+                                "error": prime.error_payload
+                                or {"message": prime.error_message, "code": prime.error_code}
+                            },
+                            headers={k: v for k, v in resp_headers.items() if k.lower() != "content-type"},
                         )
 
                     is_rl = prime.status == "retry_rate_limit"
@@ -1337,7 +1675,12 @@ async def handle_responses(request: Request):
                     logger.error("[Forwarding Stream Error 502] %s", prime.error_message[:200])
                     return JSONResponse(
                         status_code=502,
-                        content={"error": {"message": prime.error_message or "Upstream stream failed before emitting output", "type": "proxy_error"}},
+                        content={
+                            "error": {
+                                "message": prime.error_message or "Upstream stream failed before emitting output",
+                                "type": "proxy_error",
+                            }
+                        },
                     )
 
                 if resp.status_code == 200:
@@ -1358,7 +1701,11 @@ async def handle_responses(request: Request):
                         if is_resource_mismatch_text(msg):
                             if activate_stateless_fallback("JSON 200 error", msg):
                                 continue
-                        elif _is_rate_limit_error(code, msg) or _is_transient_error(code, msg):
+                            # Reference-only requests cannot be reconstructed.
+                            # Preserve the upstream JSON result instead of
+                            # counting a destructive retry as a recovery.
+                            return Response(content=body, status_code=200, headers=resp_headers)
+                        if _is_rate_limit_error(code, msg) or _is_transient_error(code, msg):
                             is_rl = _is_rate_limit_error(code, msg)
                             should_retry, suggested_ra = await schedule_transient_wait(
                                 is_rl, resp.headers, msg, "Rate Limit / JSON" if is_rl else "JSON Error"
@@ -1419,7 +1766,12 @@ async def handle_responses(request: Request):
             logger.error("[Attempt Exception] %s", err_detail)
             last_failure_response = JSONResponse(
                 status_code=502,
-                content={"error": {"message": f"Proxy upstream communication error: {err_detail}", "type": "proxy_error"}},
+                content={
+                    "error": {
+                        "message": f"Proxy upstream communication error: {err_detail}",
+                        "type": "proxy_error",
+                    }
+                },
             )
             should_retry, _ = await schedule_transient_wait(False, {}, err_detail, "Attempt Exception")
             if should_retry:
@@ -1481,4 +1833,4 @@ if __name__ == "__main__":
     url_host = f"[{LISTEN_HOST}]" if ":" in LISTEN_HOST and not LISTEN_HOST.startswith("[") else LISTEN_HOST
     print(f"[*] Starting agentrouter-codex-proxy on http://{url_host}:{PORT} ({bind_scope})")
     print(f"[*] Forwarding to upstream: {UPSTREAM}")
-    uvicorn.run(app, host=LISTEN_HOST, port=PORT, timeout_keep_alive=600, log_level="info")
+    uvicorn.run(app, host=LISTEN_HOST, port=PORT, timeout_keep_alive=int(KEEPALIVE_TIMEOUT_S), log_level="info")
